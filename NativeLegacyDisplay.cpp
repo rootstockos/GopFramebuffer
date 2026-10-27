@@ -42,8 +42,11 @@ extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint6
 extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // Direct scanout (sheng-dpu-scanout=2): the display's two pipes fetch the compositor's surface through the display bank's window
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
-// [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory.
-extern "C" {volatile uint32_t native_legacy_direct[9];}
+// [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
+// [9] how startDirect ended (1 on, 2 the bank never reported, 3 the bank refused stage 1, 4 no MDP mapping or timer, 5 the GOP is not the
+// boot mapping, 6 a named pipe does not scan out the boot memory), [10] ms waited for the bank, [11] VIG 0's source address, [12] pipes
+// found | their flush bits << 8.
+extern "C" {volatile uint32_t native_legacy_direct[13];}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -141,7 +144,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint32_t directVig[8]={},directPipes=0,directFlush=0,bootIova=0,bootStride=0;
     void startDirect() {
         unsigned mode=0;PE_parse_boot_argn("sheng-dpu-scanout",&mode,sizeof(mode));
-        if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !(native_ufs_dpu_state>>31) || !primary)return;
+        if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
+        // NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window (T40k: the
+        // bank came up, yet no swap tried it; [9] says which step stopped). Wait for it, up to 500 ms. 0xdead000n is a refusal, not a bank.
+        unsigned waited=0;
+        for(;!native_ufs_dpu_state && waited<500;waited+=5)IOSleep(5);
+        native_legacy_direct[10]=waited;
+        const uint32_t state=native_ufs_dpu_state;
+        if(!state){native_legacy_direct[9]=2;return;}
+        if(!(state>>31) || (state>>16)==0xdead){native_legacy_direct[9]=3;return;}
         IODeviceMemory *memory=IODeviceMemory::withRange(0xae01000,0x8f000);
         mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(memory)memory->release();
@@ -151,25 +162,28 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!mdpMap || !directPages || !latchTimer || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
             OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);
             if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
-            return;
+            native_legacy_direct[9]=4;return;
         }
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
         PE_Video video={};
         const uint64_t boot=bootMapping?bootMapping->getPhysicalAddress():0;
         uint32_t want=0x3;PE_parse_boot_argn("sheng-dpu-flush",&want,sizeof(want));
+        native_legacy_direct[11]=mdp[(0x4000+0x14)/4];
         if(!PE_current_console(&video) && boot && boot<=0xffffffffull && video.v_baseAddr==boot) {
             bootIova=uint32_t(boot);bootStride=uint32_t(video.v_rowBytes);
             for(const DirectPipe &pipe:kPipes)
                 if((want&pipe.bit) && mdp[(pipe.offset+0x14)/4]==bootIova){directVig[directPipes++]=pipe.offset;directFlush|=pipe.bit;}
         }
         IOLog("NativeLegacyDisplay: direct scanout pipes %u flush %x of %x, boot %x stride %u\n",directPipes,directFlush,want,bootIova,bootStride);
+        native_legacy_direct[12]=directPipes|(directFlush<<8);
         if(!directPipes || directFlush!=want) {   /* a named pipe that does not scan out the boot memory: keep the copy */
+            native_legacy_direct[9]=bootIova?6:5;
             OSSafeReleaseNULL(mdpMap);mdp=nullptr;
             if(latchTimer){if(IOWorkLoop *l=getWorkLoop())l->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
             IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;
             return;
         }
-        directOn=true;
+        directOn=true;native_legacy_direct[9]=1;
     }
     void flip(uint32_t iova,uint32_t stride) {
         for(uint32_t i=0;i<directPipes;++i){mdp[(directVig[i]+0x14)/4]=iova;mdp[(directVig[i]+0x24)/4]=stride&0xffff;}
