@@ -45,8 +45,12 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
 // [9] how startDirect ended (1 on, 2 the bank never reported, 3 the bank refused stage 1, 4 no MDP mapping or timer, 5 the GOP is not the
 // boot mapping, 6 a named pipe does not scan out the boot memory), [10] ms waited for the bank, [11] VIG 0's source address, [12] pipes
-// found | their flush bits << 8.
-extern "C" {volatile uint32_t native_legacy_direct[13];}
+// found | their flush bits << 8, [13] flips that waited for the GPU, [14] longest such wait (us), [15] total (us), [16] waits that gave up
+// after 100 ms and flipped anyway.
+extern "C" {volatile uint32_t native_legacy_direct[17];}
+// The GPU driver's newest submitted fence and its fence page (Adreno740 NativeAdrenoRing.cpp / NativeAdrenoService.cpp).
+extern "C" volatile uint32_t native_adreno_submitted_fence __attribute__((weak_import));
+extern "C" volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -131,6 +135,33 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
+    // The flip waits for the GPU (T41: flipping at the swap showed frames half drawn, the wallpaper without the app on top): the swap
+    // comes as soon as the compositor has queued its drawing, and only the copy path, itself a GPU job behind that drawing, waited by
+    // construction. gpuTarget is the newest submitted fence at the swap; the flip happens once the fence page's completed timestamp
+    // reaches it. fenceMap maps that page uncached.
+    IOMemoryMap *fenceMap=nullptr;
+    volatile uint32_t *fenceDone=nullptr;
+    uint32_t gpuTarget=0,flipIova=0,flipStride=0;
+    uint64_t gpuWaitStart=0;
+    bool gpuWaiting=false;
+    // True when the GPU has finished every submission up to gpuTarget (or the GPU driver is not there to ask).
+    bool gpuCaughtUp() {
+        if(!&native_adreno_submitted_fence || !&native_adreno_fence_phys)return true;
+        if(!fenceDone && native_adreno_fence_phys) {
+            const uint64_t page=native_adreno_fence_phys&~0xfffull;
+            if(IODeviceMemory *memory=IODeviceMemory::withRange(page,0x1000)) {
+                fenceMap=memory->map(kIOMapAnywhere|kIOMapInhibitCache);memory->release();
+                if(fenceMap)fenceDone=reinterpret_cast<volatile uint32_t *>(fenceMap->getVirtualAddress()+(native_adreno_fence_phys&0xfff)+4);
+            }
+        }
+        if(!fenceDone)return true;
+        return int32_t(*fenceDone-gpuTarget)>=0;
+    }
+    void flipNow() {
+        flip(flipIova,flipStride);directBoot=false;
+        native_legacy_direct[0]=native_legacy_direct[0]+1;
+        latchStart=mach_absolute_time();
+    }
     int shownSlot=-1,pendingSlot=-1;
     bool directOn=false,directBoot=true;
     static constexpr uint32_t kCtlFlush=0x15018;
@@ -225,6 +256,17 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(!latchRequest)return;
+        if(gpuWaiting) {
+            uint64_t waited=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuWaitStart,&waited);
+            const bool done=gpuCaughtUp();
+            if(!done && waited<100000000ull){latchTimer->setTimeoutUS(250);return;}
+            if(!done)native_legacy_direct[16]=native_legacy_direct[16]+1;
+            const uint32_t us=uint32_t(waited/1000);
+            native_legacy_direct[13]=native_legacy_direct[13]+1;
+            if(us>native_legacy_direct[14])native_legacy_direct[14]=us;
+            native_legacy_direct[15]=native_legacy_direct[15]+us;
+            gpuWaiting=false;flipNow();latchTimer->setTimeoutUS(500);return;
+        }
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         if((mdp[kCtlFlush/4]&directFlush) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
@@ -298,7 +340,8 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;gpuWaiting=false;
+        fenceDone=nullptr;OSSafeReleaseNULL(fenceMap);
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -456,10 +499,11 @@ public:
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
                 native_legacy_swap_stage(1);
-                flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
-                native_legacy_direct[0]=native_legacy_direct[0]+1;
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
-                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
+                flipIova=directSlots[slot].iova;flipStride=uint32_t(sourceStride);
+                gpuTarget=&native_adreno_submitted_fence?native_adreno_submitted_fence:0;
+                if(gpuCaughtUp()){flipNow();latchTimer->setTimeoutUS(500);return;}
+                gpuWaiting=true;gpuWaitStart=mach_absolute_time();latchTimer->setTimeoutUS(250);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
