@@ -55,8 +55,8 @@ extern "C" {volatile uint32_t native_legacy_frames[9];}
 // every refresh tick while it is shown; with the GPU's submitted and completed fences. [0] flips probed, [1] content changed between
 // flip and latch, [2] between latch and leaving, [3] refresh ticks that saw the shown surface change, [4] flips with GPU work
 // outstanding, [5] flips the GPU submitted more for between flip and latch, [6] flips of a surface unchanged since it last left the
-// screen, [7] probe mapping failures, [8] flips delayed (sheng-dpu-flipdelay=<us>), [9] flips that waited for the GPU
-// (sheng-dpu-gpuwait=1), [10] waits that gave up after 100 ms, [11] longest wait (us).
+// screen, [7] probe mapping failures, [8] flips queued for the delay or the GPU, [9] flips that waited for the GPU over 1 ms (the wait
+// is on with direct scanout unless sheng-dpu-gpuwait=0), [10] waits that gave up after 100 ms, [11] longest wait (us).
 extern "C" {volatile uint32_t native_legacy_probe[12];}
 // The probe's last 24 flips, oldest first once full: slot | flags << 8 (1 changed flip-latch, 2 changed latch-leave, 4 GPU work
 // outstanding at the flip, 8 more submitted before the latch) | refresh ticks that saw a change << 16; submitted and completed at the
@@ -150,7 +150,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
     // The probe and the flip experiments (native_legacy_probe above).
-    unsigned probeOn=0,flipDelayUs=0,gpuWait=0;
+    unsigned probeOn=0,flipDelayUs=0,gpuWait=1;   // the GPU wait is on unless sheng-dpu-gpuwait=0 (T49-gpuwait: no flicker)
     struct ProbeRow {uint32_t slot,flags,ticks,subFlip,compFlip,subLatch;uint64_t flip,latch,leave,tick;};
     ProbeRow pendingRow={},shownRow={};
     unsigned frozenIn=0;
