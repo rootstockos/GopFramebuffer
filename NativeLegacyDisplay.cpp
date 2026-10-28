@@ -154,7 +154,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
     // The probe and the flip experiments (native_legacy_probe above).
-    unsigned probeOn=0,flipDelayUs=0,gpuWait=1;   // the GPU wait is on unless sheng-dpu-gpuwait=0 (T49-gpuwait: no flicker)
+    unsigned probeOn=0,flipDelayUs=0,gpuWait=1,earlyDone=0;
+    // sheng-dpu-early-done=1: the swap is reported complete as soon as its flip is programmed, not when the display latches it, so the
+    // compositor starts the next frame during the latch (T51: 4.5 ms mean, on every frame after the GPU's 8-12 ms); the next flip still
+    // waits for the latch (transferred stays set until then).
+    bool latchRetired=false;   // the GPU wait is on unless sheng-dpu-gpuwait=0 (T49-gpuwait: no flicker)
     struct ProbeRow {uint32_t slot,flags,ticks,subFlip,compFlip,subLatch;uint64_t flip,latch,leave,tick;};
     ProbeRow pendingRow={},shownRow={};
     unsigned frozenIn=0;
@@ -225,6 +229,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         PE_parse_boot_argn("sheng-dpu-probe",&probeOn,sizeof(probeOn));
         PE_parse_boot_argn("sheng-dpu-flipdelay",&flipDelayUs,sizeof(flipDelayUs));if(flipDelayUs>50000)flipDelayUs=50000;
         PE_parse_boot_argn("sheng-dpu-gpuwait",&gpuWait,sizeof(gpuWait));
+        PE_parse_boot_argn("sheng-dpu-early-done",&earlyDone,sizeof(earlyDone));
         getDisplayDimensions(&probeWidth,&probeHeight);
         if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
         // NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window (T40k: the
@@ -324,6 +329,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(directSlots[pendingSlot].left && pendingRow.flip==directSlots[pendingSlot].left)native_legacy_probe[6]=native_legacy_probe[6]+1;
         }
     }
+    void retireEarly() {
+        if(earlyDone && latchRequest && !latchRetired && retireSwap(latchRequest,true))latchRetired=true;
+    }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(!latchRequest)return;
@@ -342,7 +350,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                 if(waited>1000){native_legacy_probe[9]=native_legacy_probe[9]+1;if(waited/1000>native_legacy_probe[11])native_legacy_probe[11]=uint32_t(waited/1000);}
             }
             flipQueued=flipWaiting=false;
-            directFlip();latchTimer->setTimeoutUS(500);return;
+            directFlip();retireEarly();latchTimer->setTimeoutUS(500);return;
         }
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         if((mdp[kCtlFlush/4]&directFlush) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
@@ -366,6 +374,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         timeline(2,tShown);
         shownSlot=pendingSlot;pendingSlot=-1;
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
+        if(latchRetired){latchRetired=false;transferred=false;kickSwapQueue();return;}
         finishTransfer(request,true);
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
@@ -435,7 +444,7 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;flipQueued=flipWaiting=false;
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;flipQueued=flipWaiting=false;latchRetired=false;
         for(auto &slot: directSlots)OSSafeReleaseNULL(slot.probe);
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
@@ -603,7 +612,7 @@ public:
                     latchTimer->setTimeoutUS(flipDelayUs?flipDelayUs:1);
                     return;
                 }
-                directFlip();latchTimer->setTimeoutUS(500);
+                directFlip();retireEarly();latchTimer->setTimeoutUS(500);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
