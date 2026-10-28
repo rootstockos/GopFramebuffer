@@ -46,8 +46,9 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // [9] how startDirect ended (1 on, 2 the bank never reported, 3 the bank refused stage 1, 4 no MDP mapping or timer, 5 the GOP is not the
 // boot mapping, 6 a named pipe does not scan out the boot memory), [10] ms waited for the bank, [11] VIG 0's source address, [12] pipes
 // found | their flush bits << 8, [13] flips that waited for the GPU, [14] longest such wait (us), [15] total (us), [16] waits that gave up
-// after 100 ms and flipped anyway, [17] held swaps completed by the next latch, [18] held swaps completed by the sheng-dpu-hold timeout.
-extern "C" {volatile uint32_t native_legacy_direct[19];}
+// after 100 ms and flipped anyway, [17] held swaps completed by the next latch, [18] held swaps completed by the sheng-dpu-hold timeout,
+// [19..24] time from one flip to the next: up to 17, 25, 34, 50 and 100 ms and longer, [25] the longest under a second (ms).
+extern "C" {volatile uint32_t native_legacy_direct[26];}
 // The GPU driver's newest submitted fence and its fence page (Adreno740 NativeAdrenoRing.cpp / NativeAdrenoService.cpp).
 extern "C" volatile uint32_t native_adreno_submitted_fence __attribute__((weak_import));
 extern "C" volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
@@ -172,10 +173,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!fenceDone)return true;
         return int32_t(*fenceDone-gpuTarget)>=0;
     }
+    uint64_t lastFlip=0;
     void flipNow() {
         flip(flipIova,flipStride);directBoot=false;
         native_legacy_direct[0]=native_legacy_direct[0]+1;
         latchStart=mach_absolute_time();
+        if(lastFlip) {
+            uint64_t ns=0;absolutetime_to_nanoseconds(latchStart-lastFlip,&ns);
+            const uint32_t ms=uint32_t(ns/1000000);
+            const unsigned k=ms<=17?19:ms<=25?20:ms<=34?21:ms<=50?22:ms<=100?23:24;
+            native_legacy_direct[k]=native_legacy_direct[k]+1;
+            if(ms<1000 && ms>native_legacy_direct[25])native_legacy_direct[25]=ms;
+        }
+        lastFlip=latchStart;
     }
     int shownSlot=-1,pendingSlot=-1;
     bool directOn=false,directBoot=true;
