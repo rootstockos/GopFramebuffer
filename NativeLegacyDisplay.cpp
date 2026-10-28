@@ -46,9 +46,12 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // [9] how startDirect ended (1 on, 2 the bank never reported, 3 the bank refused stage 1, 4 no MDP mapping or timer, 5 the GOP is not the
 // boot mapping, 6 a named pipe does not scan out the boot memory), [10] ms waited for the bank, [11] VIG 0's source address, [12] pipes
 // found | their flush bits << 8, [13] flips that waited for the GPU, [14] longest such wait (us), [15] total (us), [16] waits that gave up
-// after 100 ms and flipped anyway, [17] held swaps completed by the next latch, [18] held swaps completed by the sheng-dpu-hold timeout,
-// [19..24] time from one flip to the next: up to 17, 25, 34, 50 and 100 ms and longer, [25] the longest under a second (ms).
-extern "C" {volatile uint32_t native_legacy_direct[26];}
+// after 100 ms and flipped anyway, [17] held swaps completed by the next latch, [18] held swaps completed by the sheng-dpu-hold timeout.
+extern "C" {volatile uint32_t native_legacy_direct[19];}
+// Frames as they reach the screen, by any path: [0] through a copy (GPU or CPU), [1] through a direct flip, [2..7] the time since the
+// previous one: up to 17, 25, 34, 50 and 100 ms and longer, [8] the longest under a second (ms). T44 counted flips only; the copy
+// path felt slower than older builds after zero copy (T43-copy) and nothing measured it.
+extern "C" {volatile uint32_t native_legacy_frames[9];}
 // The GPU driver's newest submitted fence and its fence page (Adreno740 NativeAdrenoRing.cpp / NativeAdrenoService.cpp).
 extern "C" volatile uint32_t native_adreno_submitted_fence __attribute__((weak_import));
 extern "C" volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
@@ -173,19 +176,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!fenceDone)return true;
         return int32_t(*fenceDone-gpuTarget)>=0;
     }
-    uint64_t lastFlip=0;
+    uint64_t lastFrame=0;
+    void frameShown(bool direct) {
+        const uint64_t now=mach_absolute_time();
+        native_legacy_frames[direct]=native_legacy_frames[direct]+1;
+        if(lastFrame) {
+            uint64_t ns=0;absolutetime_to_nanoseconds(now-lastFrame,&ns);
+            const uint32_t ms=uint32_t(ns/1000000);
+            const unsigned k=ms<=17?2:ms<=25?3:ms<=34?4:ms<=50?5:ms<=100?6:7;
+            native_legacy_frames[k]=native_legacy_frames[k]+1;
+            if(ms<1000 && ms>native_legacy_frames[8])native_legacy_frames[8]=ms;
+        }
+        lastFrame=now;
+    }
     void flipNow() {
         flip(flipIova,flipStride);directBoot=false;
         native_legacy_direct[0]=native_legacy_direct[0]+1;
         latchStart=mach_absolute_time();
-        if(lastFlip) {
-            uint64_t ns=0;absolutetime_to_nanoseconds(latchStart-lastFlip,&ns);
-            const uint32_t ms=uint32_t(ns/1000000);
-            const unsigned k=ms<=17?19:ms<=25?20:ms<=34?21:ms<=50?22:ms<=100?23:24;
-            native_legacy_direct[k]=native_legacy_direct[k]+1;
-            if(ms<1000 && ms>native_legacy_direct[25])native_legacy_direct[25]=ms;
-        }
-        lastFlip=latchStart;
+        frameShown(true);
     }
     int shownSlot=-1,pendingSlot=-1;
     bool directOn=false,directBoot=true;
@@ -616,7 +624,7 @@ public:
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
-        native_legacy_transfer_observed(kIOReturnSuccess,request,length);
+        native_legacy_transfer_observed(kIOReturnSuccess,request,length);frameShown(false);
         finishTransfer(request);
     }
     // The GPU client reported its copy (status 0) or lost it. Success retires the swap like a finished copy; anything else uses the CPU copy.
@@ -628,12 +636,12 @@ public:
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
             // (the next one takes the CPU copy).
             gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            if(status==0){native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);}
             else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
             transferred=false;kickSwapQueue();return;
         }
         if(status==0) {
-            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);
