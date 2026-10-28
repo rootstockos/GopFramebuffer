@@ -48,8 +48,12 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // found | their flush bits << 8.
 extern "C" {volatile uint32_t native_legacy_direct[13];}
 // Frames as they reach the screen, by any path: [0] through a copy (GPU or CPU), [1] through a direct flip, [2..7] the time since the
-// previous one: up to 17, 25, 34, 50 and 100 ms and longer, [8] the longest under a second (ms).
+// previous one: up to 9 ms (120 Hz), 17 (60 Hz), 25, 34 and 50 ms and longer, [8] the longest under a second (ms).
 extern "C" {volatile uint32_t native_legacy_frames[9];}
+// T51: where each frame's time goes. [0] from the previous swap's retirement to the next swap (the compositor's own time: its CPU work and
+// its GPU submissions), [1] from the swap to the frame being shown (the GPU wait and flip, or the GPU copy), [2] from the flip to the
+// display latching it (direct scanout). Each: [0..8] under 1, 2, 4, 8, 12, 17, 25, 50 ms, then longer; [9] total (ms).
+extern "C" {volatile uint32_t native_legacy_timeline[3][10];}
 // Zero-copy probe (sheng-dpu-probe=1): what the display fetches, read through an uncached mapping of each surface (as the display
 // reads memory), 16 points of a 4 x 4 grid as 4-bit luminance, at the flip, at the latch and when the surface leaves the screen, and on
 // every refresh tick while it is shown; with the GPU's submitted and completed fences. [0] flips probed, [1] content changed between
@@ -182,14 +186,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(frozenIn){if(--frozenIn==0)probeFrozen=true;}
         else if((r.flags&3) || r.ticks)frozenIn=12;   // a content change: keep it with 11 rows before and 12 after
     }
+    uint64_t tRetired=0,tSwap=0,tShown=0;
+    static void timeline(unsigned stage,uint64_t from) {
+        if(!from)return;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-from,&ns);
+        const uint32_t us=uint32_t(ns/1000);
+        const unsigned b=us<1000?0:us<2000?1:us<4000?2:us<8000?3:us<12000?4:us<17000?5:us<25000?6:us<50000?7:8;
+        native_legacy_timeline[stage][b]=native_legacy_timeline[stage][b]+1;
+        static uint64_t totalUs[3];
+        totalUs[stage]+=us;native_legacy_timeline[stage][9]=uint32_t(totalUs[stage]/1000);
+    }
     uint64_t lastFrame=0;
     void frameShown(bool direct) {
         const uint64_t now=mach_absolute_time();
         native_legacy_frames[direct]=native_legacy_frames[direct]+1;
         if(lastFrame) {
             uint64_t ns=0;absolutetime_to_nanoseconds(now-lastFrame,&ns);
-            const uint32_t ms=uint32_t(ns/1000000);
-            const unsigned k=ms<=17?2:ms<=25?3:ms<=34?4:ms<=50?5:ms<=100?6:7;
+            const uint32_t ms=uint32_t(ns/1000000),us=uint32_t(ns/1000);
+            const unsigned k=us<=9000?2:us<=17000?3:us<=25000?4:us<=34000?5:us<=50000?6:7;
             native_legacy_frames[k]=native_legacy_frames[k]+1;
             if(ms<1000 && ms>native_legacy_frames[8])native_legacy_frames[8]=ms;
         }
@@ -300,6 +314,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         flip(directSlots[pendingSlot].iova,directSlots[pendingSlot].stride);directBoot=false;
         native_legacy_direct[0]=native_legacy_direct[0]+1;frameShown(true);
         latchStart=mach_absolute_time();
+        timeline(1,tSwap);tShown=latchStart;
         if(probeOn) {
             native_legacy_probe[0]=native_legacy_probe[0]+1;
             pendingRow={uint32_t(pendingSlot),0,0,0,0,0,0,0,0,0};
@@ -348,6 +363,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             }
             shownRow=pendingRow;shownRow.tick=shownRow.latch;
         }
+        timeline(2,tShown);
         shownSlot=pendingSlot;pendingSlot=-1;
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
         finishTransfer(request,true);
@@ -578,6 +594,7 @@ public:
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
                 native_legacy_swap_stage(1);
+                tSwap=mach_absolute_time();timeline(0,tRetired);
                 directSlots[slot].stride=uint32_t(sourceStride);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
                 if(flipDelayUs || gpuWait) {
@@ -595,6 +612,7 @@ public:
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
+            tSwap=mach_absolute_time();timeline(0,tRetired);
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
             // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
@@ -669,12 +687,12 @@ public:
             // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
             // (the next one takes the CPU copy).
             gpuRetired=false;
-            if(status==0){native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);}
+            if(status==0){native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);timeline(1,tSwap);}
             else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
             transferred=false;kickSwapQueue();return;
         }
         if(status==0) {
-            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);
+            native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);frameShown(false);timeline(1,tSwap);
             finishTransfer(request,true);return;
         }
         native_legacy_gpu_fallback_observed(status);
@@ -690,6 +708,7 @@ public:
         removeValidated(request);
         IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);
+        tRetired=mach_absolute_time();
         return true;
     }
     // Separately gated retirement after a real scanout store, shared by copied and blank frames.
