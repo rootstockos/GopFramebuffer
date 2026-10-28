@@ -50,6 +50,21 @@ extern "C" {volatile uint32_t native_legacy_direct[13];}
 // Frames as they reach the screen, by any path: [0] through a copy (GPU or CPU), [1] through a direct flip, [2..7] the time since the
 // previous one: up to 17, 25, 34, 50 and 100 ms and longer, [8] the longest under a second (ms).
 extern "C" {volatile uint32_t native_legacy_frames[9];}
+// Zero-copy probe (sheng-dpu-probe=1): what the display fetches, read through an uncached mapping of each surface (as the display
+// reads memory), 16 points of a 4 x 4 grid as 4-bit luminance, at the flip, at the latch and when the surface leaves the screen, and on
+// every refresh tick while it is shown; with the GPU's submitted and completed fences. [0] flips probed, [1] content changed between
+// flip and latch, [2] between latch and leaving, [3] refresh ticks that saw the shown surface change, [4] flips with GPU work
+// outstanding, [5] flips the GPU submitted more for between flip and latch, [6] flips of a surface unchanged since it last left the
+// screen, [7] probe mapping failures, [8] flips delayed (sheng-dpu-flipdelay=<us>), [9] flips that waited for the GPU
+// (sheng-dpu-gpuwait=1), [10] waits that gave up after 100 ms, [11] longest wait (us).
+extern "C" {volatile uint32_t native_legacy_probe[12];}
+// The probe's last 24 flips, oldest first once full: slot | flags << 8 (1 changed flip-latch, 2 changed latch-leave, 4 GPU work
+// outstanding at the flip, 8 more submitted before the latch) | refresh ticks that saw a change << 16; submitted and completed at the
+// flip, submitted at the latch; the three signatures (64 bits each: flip, latch, leave). A circular buffer: native_legacy_probe_next
+// counts the rows written (row n at n % 24); recording stops 12 flips after the first content change, so it keeps that flip and its
+// neighbours.
+extern "C" {volatile uint32_t native_legacy_probe_ring[24][10];volatile uint32_t native_legacy_probe_next;}
+extern "C" bool native_gpu_fences(uint32_t *submitted,uint32_t *completed) __attribute__((weak_import));
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -125,7 +140,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
     // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
     // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
-    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used;};
+    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used;IOMemoryMap *probe;uint32_t stride;uint64_t left;};
     static constexpr unsigned kDirectSlots=4;
     DirectSlot directSlots[kDirectSlots]={};
     IOMemoryMap *mdpMap=nullptr;
@@ -134,6 +149,39 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
+    // The probe and the flip experiments (native_legacy_probe above).
+    unsigned probeOn=0,flipDelayUs=0,gpuWait=0;
+    struct ProbeRow {uint32_t slot,flags,ticks,subFlip,compFlip,subLatch;uint64_t flip,latch,leave,tick;};
+    ProbeRow pendingRow={},shownRow={};
+    unsigned frozenIn=0;
+    bool flipQueued=false;uint32_t flipTarget=0;uint64_t flipQueuedAt=0,flipWaitAt=0;bool flipWaiting=false;
+    uint32_t probeWidth=0,probeHeight=0;
+    static bool fences(uint32_t *sub,uint32_t *comp) {*sub=*comp=0;return &native_gpu_fences && native_gpu_fences(sub,comp);}
+    uint64_t sample(int k) {
+        if(k<0 || !directSlots[k].probe)return 0;
+        const volatile uint8_t *base=reinterpret_cast<const volatile uint8_t *>(directSlots[k].probe->getVirtualAddress());
+        const uint64_t bytes=directSlots[k].probe->getLength();
+        uint64_t sig=0;
+        for(unsigned i=0;i<16;++i) {
+            const uint64_t x=probeWidth*(2*(i%4)+1)/8,y=probeHeight*(2*(i/4)+1)/8,at=y*directSlots[k].stride+x*4;
+            if(at+4>bytes)continue;
+            const uint32_t px=*reinterpret_cast<const volatile uint32_t *>(base+at);
+            const uint32_t lum=((px&0xff)+((px>>8)&0xff)*2+((px>>16)&0xff))/4;
+            sig|=uint64_t(lum>>4)<<(4*i);
+        }
+        return sig;
+    }
+    bool probeFrozen=false;
+    void probeRecord(const ProbeRow &r) {
+        if(probeFrozen)return;
+        volatile uint32_t *w=native_legacy_probe_ring[native_legacy_probe_next%24];
+        w[0]=r.slot|r.flags<<8|(r.ticks>0xffff?0xffff:r.ticks)<<16;w[1]=r.subFlip;w[2]=r.compFlip;w[3]=r.subLatch;
+        w[4]=uint32_t(r.flip);w[5]=uint32_t(r.flip>>32);w[6]=uint32_t(r.latch);w[7]=uint32_t(r.latch>>32);
+        w[8]=uint32_t(r.leave);w[9]=uint32_t(r.leave>>32);
+        native_legacy_probe_next=native_legacy_probe_next+1;
+        if(frozenIn){if(--frozenIn==0)probeFrozen=true;}
+        else if((r.flags&3) || r.ticks)frozenIn=12;   // a content change: keep it with 11 rows before and 12 after
+    }
     uint64_t lastFrame=0;
     void frameShown(bool direct) {
         const uint64_t now=mach_absolute_time();
@@ -160,6 +208,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint32_t directVig[8]={},directPipes=0,directFlush=0,bootIova=0,bootStride=0;
     void startDirect() {
         unsigned mode=0;PE_parse_boot_argn("sheng-dpu-scanout",&mode,sizeof(mode));
+        PE_parse_boot_argn("sheng-dpu-probe",&probeOn,sizeof(probeOn));
+        PE_parse_boot_argn("sheng-dpu-flipdelay",&flipDelayUs,sizeof(flipDelayUs));if(flipDelayUs>50000)flipDelayUs=50000;
+        PE_parse_boot_argn("sheng-dpu-gpuwait",&gpuWait,sizeof(gpuWait));
+        getDisplayDimensions(&probeWidth,&probeHeight);
         if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
         // NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window (T40k: the
         // bank came up, yet no swap tried it; [9] says which step stopped). Wait for it, up to 500 ms. 0xdead000n is a refusal, not a bank.
@@ -219,6 +271,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(pick<0)return -1;
         DirectSlot &slot=directSlots[pick];
         if(slot.surface) {
+            OSSafeReleaseNULL(slot.probe);
             slot.memory->complete();OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
             native_legacy_direct[6]=native_legacy_direct[6]+1;
         }
@@ -234,19 +287,67 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
         if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
         surface->retain();memory->retain();
-        slot={surface,memory,iova,directClock};
+        IOMemoryMap *probe=nullptr;
+        if(probeOn) {
+            probe=memory->map(kIOMapAnywhere|kIOMapInhibitCache|kIOMapReadOnly);
+            if(!probe)native_legacy_probe[7]=native_legacy_probe[7]+1;
+        }
+        slot={surface,memory,iova,directClock,probe,0,0};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
+    }
+    void directFlip() {
+        flip(directSlots[pendingSlot].iova,directSlots[pendingSlot].stride);directBoot=false;
+        native_legacy_direct[0]=native_legacy_direct[0]+1;frameShown(true);
+        latchStart=mach_absolute_time();
+        if(probeOn) {
+            native_legacy_probe[0]=native_legacy_probe[0]+1;
+            pendingRow={uint32_t(pendingSlot),0,0,0,0,0,0,0,0,0};
+            fences(&pendingRow.subFlip,&pendingRow.compFlip);
+            if(int32_t(pendingRow.compFlip-pendingRow.subFlip)<0){pendingRow.flags|=4;native_legacy_probe[4]=native_legacy_probe[4]+1;}
+            pendingRow.flip=sample(pendingSlot);
+            if(directSlots[pendingSlot].left && pendingRow.flip==directSlots[pendingSlot].left)native_legacy_probe[6]=native_legacy_probe[6]+1;
+        }
     }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(!latchRequest)return;
+        if(flipQueued) {
+            // sheng-dpu-flipdelay, then sheng-dpu-gpuwait: wait for everything the GPU has been given by the end of the delay.
+            const uint64_t now=mach_absolute_time();
+            uint64_t ns=0;absolutetime_to_nanoseconds(now-flipQueuedAt,&ns);
+            if(ns<uint64_t(flipDelayUs)*1000){latchTimer->setTimeoutUS(uint32_t((uint64_t(flipDelayUs)*1000-ns)/1000)+1);return;}
+            if(gpuWait) {
+                uint32_t sub=0,comp=0;
+                if(!flipWaiting){fences(&sub,&comp);flipTarget=sub;flipWaitAt=now;flipWaiting=true;}
+                fences(&sub,&comp);
+                uint64_t waited=0;absolutetime_to_nanoseconds(now-flipWaitAt,&waited);
+                if(int32_t(comp-flipTarget)<0 && waited<100000000ull){latchTimer->setTimeoutUS(250);return;}
+                if(int32_t(comp-flipTarget)<0)native_legacy_probe[10]=native_legacy_probe[10]+1;
+                if(waited>1000){native_legacy_probe[9]=native_legacy_probe[9]+1;if(waited/1000>native_legacy_probe[11])native_legacy_probe[11]=uint32_t(waited/1000);}
+            }
+            flipQueued=flipWaiting=false;
+            directFlip();latchTimer->setTimeoutUS(500);return;
+        }
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         if((mdp[kCtlFlush/4]&directFlush) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
         const uint32_t us=uint32_t(ns/1000);
         if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
         native_legacy_direct[5]=native_legacy_direct[5]+us;
+        if(probeOn) {
+            pendingRow.latch=sample(pendingSlot);
+            uint32_t comp=0;fences(&pendingRow.subLatch,&comp);
+            if(pendingRow.latch!=pendingRow.flip){pendingRow.flags|=1;native_legacy_probe[1]=native_legacy_probe[1]+1;}
+            if(pendingRow.subLatch!=pendingRow.subFlip){pendingRow.flags|=8;native_legacy_probe[5]=native_legacy_probe[5]+1;}
+            if(shownSlot>=0 && shownSlot!=pendingSlot) {
+                // The surface on screen until now leaves it: what did it hold at the end?
+                shownRow.leave=sample(shownSlot);directSlots[shownSlot].left=shownRow.leave;
+                if(shownRow.leave!=shownRow.latch){shownRow.flags|=2;native_legacy_probe[2]=native_legacy_probe[2]+1;}
+                probeRecord(shownRow);
+            }
+            shownRow=pendingRow;shownRow.tick=shownRow.latch;
+        }
         shownSlot=pendingSlot;pendingSlot=-1;
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
         finishTransfer(request,true);
@@ -273,6 +374,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!vsyncTimer)return;
         if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
+        if(probeOn && shownSlot>=0 && !latchRequest) {
+            const uint64_t sig=sample(shownSlot);
+            if(sig!=shownRow.tick){shownRow.tick=sig;++shownRow.ticks;native_legacy_probe[3]=native_legacy_probe[3]+1;}
+        }
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
         vsyncNext+=vsyncInterval;
@@ -314,7 +419,8 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;flipQueued=flipWaiting=false;
+        for(auto &slot: directSlots)OSSafeReleaseNULL(slot.probe);
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -472,10 +578,15 @@ public:
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
                 native_legacy_swap_stage(1);
-                flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
-                native_legacy_direct[0]=native_legacy_direct[0]+1;frameShown(true);
+                directSlots[slot].stride=uint32_t(sourceStride);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
-                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
+                if(flipDelayUs || gpuWait) {
+                    flipQueued=true;flipWaiting=false;flipQueuedAt=mach_absolute_time();
+                    native_legacy_probe[8]=native_legacy_probe[8]+1;
+                    latchTimer->setTimeoutUS(flipDelayUs?flipDelayUs:1);
+                    return;
+                }
+                directFlip();latchTimer->setTimeoutUS(500);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
