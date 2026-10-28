@@ -45,16 +45,11 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
 // [9] how startDirect ended (1 on, 2 the bank never reported, 3 the bank refused stage 1, 4 no MDP mapping or timer, 5 the GOP is not the
 // boot mapping, 6 a named pipe does not scan out the boot memory), [10] ms waited for the bank, [11] VIG 0's source address, [12] pipes
-// found | their flush bits << 8, [13] flips that waited for the GPU, [14] longest such wait (us), [15] total (us), [16] waits that gave up
-// after 100 ms and flipped anyway, [17] held swaps completed by the next latch, [18] held swaps completed by the sheng-dpu-hold timeout.
-extern "C" {volatile uint32_t native_legacy_direct[19];}
+// found | their flush bits << 8.
+extern "C" {volatile uint32_t native_legacy_direct[13];}
 // Frames as they reach the screen, by any path: [0] through a copy (GPU or CPU), [1] through a direct flip, [2..7] the time since the
-// previous one: up to 17, 25, 34, 50 and 100 ms and longer, [8] the longest under a second (ms). T44 counted flips only; the copy
-// path felt slower than older builds after zero copy (T43-copy) and nothing measured it.
+// previous one: up to 17, 25, 34, 50 and 100 ms and longer, [8] the longest under a second (ms).
 extern "C" {volatile uint32_t native_legacy_frames[9];}
-// The GPU driver's newest submitted fence and its fence page (Adreno740 NativeAdrenoRing.cpp / NativeAdrenoService.cpp).
-extern "C" volatile uint32_t native_adreno_submitted_fence __attribute__((weak_import));
-extern "C" volatile uint64_t native_adreno_fence_phys __attribute__((weak_import));
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -139,43 +134,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     IOTimerEventSource *latchTimer=nullptr;
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
-    // The flip waits for the GPU (T41: flipping at the swap showed frames half drawn, the wallpaper without the app on top): the swap
-    // comes as soon as the compositor has queued its drawing, and only the copy path, itself a GPU job behind that drawing, waited by
-    // construction. gpuTarget is the newest submitted fence at the swap; the flip happens once the fence page's completed timestamp
-    // reaches it. fenceMap maps that page uncached.
-    IOMemoryMap *fenceMap=nullptr;
-    volatile uint32_t *fenceDone=nullptr;
-    uint32_t gpuTarget=0,flipIova=0,flipStride=0;
-    uint64_t gpuWaitStart=0;
-    bool gpuWaiting=false;
-    // Holding the shown swap (sheng-dpu-hold=<ms>, 0 off). The original completion (slot 295) releases the current swap's surfaces to the
-    // compositor, which draws its next frame into whichever is free: completing a swap as soon as it latched gave back the surface the
-    // display still fetched (T42: opening apps alternated the new frame with the wallpaper alone, the next frame being drawn over it).
-    // heldRequest stays the family's current swap while it is on screen; the next latch, or holdMs with no new swap, completes it.
-    const OriginalLegacySwapRequest *heldRequest=nullptr;
-    uint64_t heldAt=0;
-    unsigned holdMs=0;
-    void releaseHeld(bool timedOut) {
-        if(!heldRequest)return;
-        heldRequest=nullptr;
-        IOMobileFramebufferLegacy::completeCurrentSwap();
-        native_legacy_retirement_observed(this);
-        if(timedOut)native_legacy_direct[18]=native_legacy_direct[18]+1;
-        else native_legacy_direct[17]=native_legacy_direct[17]+1;
-    }
-    // True when the GPU has finished every submission up to gpuTarget (or the GPU driver is not there to ask).
-    bool gpuCaughtUp() {
-        if(!&native_adreno_submitted_fence || !&native_adreno_fence_phys)return true;
-        if(!fenceDone && native_adreno_fence_phys) {
-            const uint64_t page=native_adreno_fence_phys&~0xfffull;
-            if(IODeviceMemory *memory=IODeviceMemory::withRange(page,0x1000)) {
-                fenceMap=memory->map(kIOMapAnywhere|kIOMapInhibitCache);memory->release();
-                if(fenceMap)fenceDone=reinterpret_cast<volatile uint32_t *>(fenceMap->getVirtualAddress()+(native_adreno_fence_phys&0xfff)+4);
-            }
-        }
-        if(!fenceDone)return true;
-        return int32_t(*fenceDone-gpuTarget)>=0;
-    }
     uint64_t lastFrame=0;
     void frameShown(bool direct) {
         const uint64_t now=mach_absolute_time();
@@ -188,12 +146,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             if(ms<1000 && ms>native_legacy_frames[8])native_legacy_frames[8]=ms;
         }
         lastFrame=now;
-    }
-    void flipNow() {
-        flip(flipIova,flipStride);directBoot=false;
-        native_legacy_direct[0]=native_legacy_direct[0]+1;
-        latchStart=mach_absolute_time();
-        frameShown(true);
     }
     int shownSlot=-1,pendingSlot=-1;
     bool directOn=false,directBoot=true;
@@ -208,7 +160,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint32_t directVig[8]={},directPipes=0,directFlush=0,bootIova=0,bootStride=0;
     void startDirect() {
         unsigned mode=0;PE_parse_boot_argn("sheng-dpu-scanout",&mode,sizeof(mode));
-        PE_parse_boot_argn("sheng-dpu-hold",&holdMs,sizeof(holdMs));if(holdMs>1000)holdMs=1000;
         if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
         // NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window (T40k: the
         // bank came up, yet no swap tried it; [9] says which step stopped). Wait for it, up to 500 ms. 0xdead000n is a refusal, not a bank.
@@ -289,24 +240,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
-        if(!latchRequest) {
-            if(!heldRequest)return;
-            uint64_t held=0;absolutetime_to_nanoseconds(mach_absolute_time()-heldAt,&held);
-            if(held<holdMs*1000000ull){latchTimer->setTimeoutUS(uint32_t((holdMs*1000000ull-held)/1000)+1);return;}
-            releaseHeld(true);
-            return;
-        }
-        if(gpuWaiting) {
-            uint64_t waited=0;absolutetime_to_nanoseconds(mach_absolute_time()-gpuWaitStart,&waited);
-            const bool done=gpuCaughtUp();
-            if(!done && waited<100000000ull){latchTimer->setTimeoutUS(250);return;}
-            if(!done)native_legacy_direct[16]=native_legacy_direct[16]+1;
-            const uint32_t us=uint32_t(waited/1000);
-            native_legacy_direct[13]=native_legacy_direct[13]+1;
-            if(us>native_legacy_direct[14])native_legacy_direct[14]=us;
-            native_legacy_direct[15]=native_legacy_direct[15]+us;
-            gpuWaiting=false;flipNow();latchTimer->setTimeoutUS(500);return;
-        }
+        if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         if((mdp[kCtlFlush/4]&directFlush) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
@@ -315,16 +249,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[5]=native_legacy_direct[5]+us;
         shownSlot=pendingSlot;pendingSlot=-1;
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
-        if(holdMs) {
-            // The previous frame is off screen now: complete it, then keep this one current until it is replaced in turn.
-            releaseHeld(false);
-            if(activateOnlyPendingSwap(request)) {
-                removeValidated(request);heldRequest=request;heldAt=mach_absolute_time();
-                latchTimer->setTimeoutMS(holdMs);
-                transferred=false;kickSwapQueue();
-                return;
-            }
-        }
         finishTransfer(request,true);
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
@@ -390,8 +314,7 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;gpuWaiting=false;releaseHeld(false);
-        fenceDone=nullptr;OSSafeReleaseNULL(fenceMap);
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -549,11 +472,10 @@ public:
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
                 native_legacy_swap_stage(1);
+                flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
+                native_legacy_direct[0]=native_legacy_direct[0]+1;frameShown(true);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
-                flipIova=directSlots[slot].iova;flipStride=uint32_t(sourceStride);
-                gpuTarget=&native_adreno_submitted_fence?native_adreno_submitted_fence:0;
-                if(gpuCaughtUp()){flipNow();latchTimer->setTimeoutUS(500);return;}
-                gpuWaiting=true;gpuWaitStart=mach_absolute_time();latchTimer->setTimeoutUS(250);
+                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
@@ -653,7 +575,6 @@ public:
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
         if(!(retire==1 || cpuPresent==1 || force))return false;
-        releaseHeld(false);   // every other path has left the held surface (directToBoot) before it retires
         if(!activateOnlyPendingSwap(request))return false;
         removeValidated(request);
         IOMobileFramebufferLegacy::completeCurrentSwap();
