@@ -936,6 +936,10 @@ public:
         }
         OSSafeReleaseNULL(mapping);return valid;
     }
+#ifndef NATIVE_LEGACY_LEAVES
+// asteroids: the iPadOS 17 builder (the device repository's build-native-legacy-display.py) writes no list; these are its leaves.
+#define NATIVE_LEGACY_LEAVES(LEAF) LEAF(211) LEAF(245) LEAF(246) LEAF(306) LEAF(307) LEAF(338) LEAF(345)
+#endif
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
     NATIVE_LEGACY_LEAVES(LEAF)
 #undef LEAF
